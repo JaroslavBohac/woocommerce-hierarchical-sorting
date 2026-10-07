@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: WooCommerce Hierarchical Sorting
- * Description: Custom product ordering by category → size → manufacturer → price, optimized for WooCommerce + AJAX + cache compatibility.
- * Version: 1.1.0
+ * Description: Custom product ordering by category → size → manufacturer → price, built for WooCommerce production use.
+ * Version: 1.2.0
  * Author: Copilot
  * Text Domain: wc-hierarchical-sorting
  * Requires at least: 6.0
@@ -22,7 +22,7 @@ final class WC_Hierarchical_Sorting {
     const PRICE_KEY       = '_sort_price_num';
     const VERSION_KEY     = '_sort_version';
     const CURRENT_VERSION = '1';
-    const SEPARATOR       = "\x1F"; // ASCII unit separator, safer than |
+    const SEPARATOR       = "\x1F";
 
     /**
      * Initialize plugin hooks.
@@ -35,24 +35,36 @@ final class WC_Hierarchical_Sorting {
         add_filter( 'posts_join', array( __CLASS__, 'posts_join' ), 10, 2 );
         add_filter( 'posts_orderby', array( __CLASS__, 'posts_orderby' ), 20, 2 );
 
-        // Single product save
         add_action( 'save_post_product', array( __CLASS__, 'save_product' ), 20, 3 );
 
-        // Term updates trigger rebuild of related products
-        add_action( 'edited_product_cat', array( __CLASS__, 'schedule_term_rebuild' ), 10, 1 );
-        add_action( 'edited_pa_raze', array( __CLASS__, 'schedule_term_rebuild' ), 10, 1 );
-        add_action( 'edited_pa_vyrobce', array( __CLASS__, 'schedule_term_rebuild' ), 10, 1 );
+        add_action( 'edited_product_cat', array( __CLASS__, 'schedule_term_rebuild' ), 10, 2 );
+        add_action( 'edited_pa_raze', array( __CLASS__, 'schedule_term_rebuild' ), 10, 2 );
+        add_action( 'edited_pa_vyrobce', array( __CLASS__, 'schedule_term_rebuild' ), 10, 2 );
 
-        // WP-Cron job for term rebuild
-        add_action( 'wc_hs_rebuild_term_job', array( __CLASS__, 'rebuild_term_products' ), 10, 1 );
-
-        // WP-Cron job for batch migration
+        add_action( 'wc_hs_rebuild_term_job', array( __CLASS__, 'rebuild_term_products' ), 10, 2 );
         add_action( 'wc_hs_migration_batch', array( __CLASS__, 'migration_batch_worker' ), 10, 1 );
 
-        // Admin page
         add_action( 'admin_menu', array( __CLASS__, 'register_admin_page' ) );
         add_action( 'admin_post_wc_hs_run_migration', array( __CLASS__, 'handle_manual_migration' ) );
         add_action( 'wp_ajax_wc_hs_run_migration', array( __CLASS__, 'ajax_migration' ) );
+        add_action( 'wp_ajax_nopriv_wc_hs_run_migration', array( __CLASS__, 'ajax_migration' ) );
+    }
+
+    /**
+     * Activate plugin and start initial migration.
+     */
+    public static function on_activation() {
+        self::schedule_migration();
+    }
+
+    /**
+     * Deactivate plugin and clean cron hooks.
+     */
+    public static function on_deactivation() {
+        wp_clear_scheduled_hook( 'wc_hs_migration_batch' );
+        wp_clear_scheduled_hook( 'wc_hs_rebuild_term_job' );
+        delete_transient( 'wc_hs_migration_active' );
+        delete_transient( 'wc_hs_migration_total' );
     }
 
     /**
@@ -150,7 +162,6 @@ final class WC_Hierarchical_Sorting {
 
     /**
      * Determine if the current query is a WooCommerce product query.
-     * Only apply sorting to actual product archives/taxonomies, not admin or other queries.
      */
     private static function is_product_query( $query ) {
         $post_type = $query->get( 'post_type' );
@@ -162,7 +173,6 @@ final class WC_Hierarchical_Sorting {
             return 'product' === $post_type;
         }
 
-        // Frontend checks only
         if ( function_exists( 'is_shop' ) && is_shop() ) {
             return true;
         }
@@ -183,7 +193,7 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Rebuild sort key when product is saved (only once per product).
+     * Rebuild sort key when product is saved.
      */
     public static function save_product( $post_id, $post, $update ) {
         if ( wp_is_post_revision( $post_id ) ) {
@@ -199,6 +209,7 @@ final class WC_Hierarchical_Sorting {
         }
 
         self::build_sort_key( $post_id );
+        self::invalidate_product_cache( $post_id );
     }
 
     /**
@@ -237,7 +248,7 @@ final class WC_Hierarchical_Sorting {
         }
 
         $old_version = get_post_meta( $product_id, self::VERSION_KEY, true );
-        if ( $old_version !== self::CURRENT_VERSION ) {
+        if ( (string) $old_version !== (string) self::CURRENT_VERSION ) {
             update_post_meta( $product_id, self::VERSION_KEY, self::CURRENT_VERSION );
         }
 
@@ -253,6 +264,18 @@ final class WC_Hierarchical_Sorting {
         }
 
         return $sort_key;
+    }
+
+    /**
+     * Invalidate WooCommerce product caches after sort key change.
+     */
+    private static function invalidate_product_cache( $product_id ) {
+        if ( function_exists( 'wc_delete_product_transients' ) ) {
+            wc_delete_product_transients( $product_id );
+        }
+
+        delete_post_meta( $product_id, '_woocommerce_product_query_cache' );
+        clean_post_cache( $product_id );
     }
 
     /**
@@ -281,18 +304,21 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Normalize each key segment (lowercase, trim, UTF-8).
+     * Normalize each key segment.
      */
     private static function normalize_sort_part( $value ) {
         if ( is_null( $value ) ) {
             return '';
         }
 
-        return mb_strtolower( trim( (string) $value ), 'UTF-8' );
+        $value = trim( (string) $value );
+
+        return mb_strtolower( $value, 'UTF-8' );
     }
 
     /**
-     * Get first term name using Collator for UTF-8 Czech sorting.
+     * Get the first term name using Collator when available.
+     * This preserves proper Czech sorting for terms like 9 mm Luger, CZ, etc.
      */
     private static function get_first_term_name( $product_id, $taxonomy ) {
         if ( empty( $taxonomy ) ) {
@@ -307,21 +333,21 @@ final class WC_Hierarchical_Sorting {
 
         $terms = array_values( $terms );
 
-        // Use Collator if available (preferred for Czech/UTF-8)
         if ( class_exists( 'Collator' ) ) {
+            $names = wp_list_pluck( $terms, 'name' );
             $locale = get_locale();
+
             if ( ! $locale || 'en_US' === $locale ) {
-                $locale = 'cs_CZ'; // Czech if not available, otherwise 'en'
+                $locale = 'cs_CZ';
             }
 
             $coll = new Collator( $locale );
-            $coll->sort( $terms );
+            $coll->asort( $names );
 
-            $first = $terms[0] ?? null;
-            return $first ? (string) $first->name : '';
+            $first_name = reset( $names );
+            return (string) $first_name;
         }
 
-        // Fallback: strcasecmp (less reliable for Czech characters)
         usort(
             $terms,
             function( $a, $b ) {
@@ -334,30 +360,38 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Schedule rebuild after a taxonomy edit (asynchronous via WP-Cron).
+     * Schedule rebuild after taxonomy edit.
      */
-    public static function schedule_term_rebuild( $term_id ) {
+    public static function schedule_term_rebuild( $term_id, $tt_id = 0, $taxonomy = '' ) {
         $term_id = absint( $term_id );
         if ( $term_id < 1 ) {
             return;
         }
 
-        // Avoid duplicate jobs
-        $hook = 'wc_hs_rebuild_term_job';
-        $args = array( $term_id );
+        if ( '' === $taxonomy ) {
+            $taxonomy = str_replace( 'edited_', '', current_filter() );
+        }
 
-        if ( ! wp_next_scheduled( $hook, $args ) ) {
-            wp_schedule_single_event( time() + 10, $hook, $args );
+        $queue = 'wc_hs_rebuild_term_job';
+        $args  = array( $term_id, $taxonomy );
+
+        if ( ! wp_next_scheduled( $queue, $args ) ) {
+            wp_schedule_single_event( time() + 10, $queue, $args );
         }
     }
 
     /**
-     * Rebuild all products in a term (WP-Cron job).
+     * Rebuild all products in a taxonomy term.
      */
-    public static function rebuild_term_products( $term_id ) {
+    public static function rebuild_term_products( $term_id, $taxonomy = 'product_cat' ) {
         $term_id = absint( $term_id );
         if ( $term_id < 1 ) {
             return 0;
+        }
+
+        $taxonomy = sanitize_key( $taxonomy );
+        if ( '' === $taxonomy ) {
+            $taxonomy = 'product_cat';
         }
 
         $page = 1;
@@ -373,7 +407,7 @@ final class WC_Hierarchical_Sorting {
                 'no_found_rows'  => true,
                 'tax_query'      => array(
                     array(
-                        'taxonomy' => 'product_cat',
+                        'taxonomy' => $taxonomy,
                         'field'    => 'term_id',
                         'terms'    => $term_id,
                     ),
@@ -387,6 +421,7 @@ final class WC_Hierarchical_Sorting {
 
             foreach ( $query->posts as $product_id ) {
                 self::build_sort_key( $product_id );
+                self::invalidate_product_cache( $product_id );
                 $total++;
             }
 
@@ -397,22 +432,21 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Start batch migration (schedules WP-Cron jobs, not blocking).
+     * Start bulk migration in chunks.
      */
-    public static function start_migration() {
+    public static function schedule_migration() {
         delete_transient( 'wc_hs_migration_active' );
-        delete_transient( 'wc_hs_migration_page' );
         delete_transient( 'wc_hs_migration_total' );
 
-        set_transient( 'wc_hs_migration_active', 1, 3600 );
-        set_transient( 'wc_hs_migration_page', 1, 3600 );
-        set_transient( 'wc_hs_migration_total', 0, 3600 );
+        set_transient( 'wc_hs_migration_active', 1, DAY_IN_SECONDS );
+        set_transient( 'wc_hs_migration_total', 0, DAY_IN_SECONDS );
 
+        wp_clear_scheduled_hook( 'wc_hs_migration_batch' );
         wp_schedule_single_event( time() + 5, 'wc_hs_migration_batch', array( 1 ) );
     }
 
     /**
-     * Batch migration worker (WP-Cron job, processes one page at a time).
+     * Process one page of migration.
      */
     public static function migration_batch_worker( $page = 1 ) {
         $page = max( 1, absint( $page ) );
@@ -433,20 +467,19 @@ final class WC_Hierarchical_Sorting {
 
         if ( empty( $query->posts ) ) {
             delete_transient( 'wc_hs_migration_active' );
-            return; // Done
+            return;
         }
 
         foreach ( $query->posts as $product_id ) {
             self::build_sort_key( $product_id );
+            self::invalidate_product_cache( $product_id );
         }
 
         $total = (int) get_transient( 'wc_hs_migration_total' );
         $total += count( $query->posts );
-
-        set_transient( 'wc_hs_migration_total', $total, 3600 );
+        set_transient( 'wc_hs_migration_total', $total, DAY_IN_SECONDS );
 
         if ( count( $query->posts ) === $per_page ) {
-            // Schedule next batch
             wp_schedule_single_event( time() + 5, 'wc_hs_migration_batch', array( $page + 1 ) );
         } else {
             delete_transient( 'wc_hs_migration_active' );
@@ -454,14 +487,14 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Get migration status for AJAX.
+     * Return migration status for admin/AJAX.
      */
     public static function get_migration_status() {
-        $active = get_transient( 'wc_hs_migration_active' );
+        $active = (bool) get_transient( 'wc_hs_migration_active' );
         $total = (int) get_transient( 'wc_hs_migration_total' );
 
         return array(
-            'active' => (bool) $active,
+            'active' => $active,
             'total'  => $total,
         );
     }
@@ -485,7 +518,7 @@ final class WC_Hierarchical_Sorting {
     }
 
     /**
-     * Render admin page with manual migration trigger.
+     * Render admin page.
      */
     public static function render_admin_page() {
         $status = self::get_migration_status();
@@ -493,15 +526,14 @@ final class WC_Hierarchical_Sorting {
 
         if ( isset( $_GET['wc_hs_status'] ) ) {
             $status_param = sanitize_key( wp_unslash( $_GET['wc_hs_status'] ) );
-
             if ( 'started' === $status_param ) {
-                $message = '<div class="notice notice-info is-dismissible"><p>' . esc_html__( 'Migration started. Sort keys are being processed in the background.', 'wc-hierarchical-sorting' ) . '</p></div>';
+                $message = '<div class="notice notice-info is-dismissible"><p>' . esc_html__( 'Migration started in the background.', 'wc-hierarchical-sorting' ) . '</p></div>';
             }
         }
 
         echo '<div class="wrap"><h1>' . esc_html__( 'Hierarchical sorting', 'wc-hierarchical-sorting' ) . '</h1>';
         echo $message;
-        echo '<p>' . esc_html__( 'This rebuilds the precomputed _sort_key meta used for category → size → manufacturer → price ordering.', 'wc-hierarchical-sorting' ) . '</p>';
+        echo '<p>' . esc_html__( 'This rebuilds the precomputed _sort_key meta used for category → size → manufacturer → price order.', 'wc-hierarchical-sorting' ) . '</p>';
 
         if ( $status['active'] ) {
             echo '<div class="notice notice-warning"><p>' . esc_html__( 'Migration in progress...', 'wc-hierarchical-sorting' ) . ' (' . absint( $status['total'] ) . ' ' . esc_html__( 'processed', 'wc-hierarchical-sorting' ) . ')</p></div>';
@@ -510,14 +542,14 @@ final class WC_Hierarchical_Sorting {
         echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
         wp_nonce_field( 'wc_hs_run_migration', 'wc_hs_nonce' );
         echo '<input type="hidden" name="action" value="wc_hs_run_migration" />';
-
         $button_text = $status['active'] ? __( 'Migration in progress...', 'wc-hierarchical-sorting' ) : __( 'Start migration', 'wc-hierarchical-sorting' );
         echo '<button class="button button-primary"' . ( $status['active'] ? ' disabled' : '' ) . ' type="submit">' . esc_html( $button_text ) . '</button>';
-        echo '</form></div>';
+        echo '</form>';
+        echo '</div>';
     }
 
     /**
-     * Handle manual migration from admin form.
+     * Handle manual migration from WooCommerce admin.
      */
     public static function handle_manual_migration() {
         if ( ! isset( $_POST['wc_hs_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wc_hs_nonce'] ) ), 'wc_hs_run_migration' ) ) {
@@ -528,14 +560,14 @@ final class WC_Hierarchical_Sorting {
             wp_die( esc_html__( 'Access denied.', 'wc-hierarchical-sorting' ) );
         }
 
-        self::start_migration();
+        self::schedule_migration();
 
         wp_safe_redirect( admin_url( 'admin.php?page=wc-hierarchical-sorting&wc_hs_status=started' ) );
         exit;
     }
 
     /**
-     * AJAX endpoint for migration status.
+     * AJAX endpoint for migration triggers/status.
      */
     public static function ajax_migration() {
         if ( ! current_user_can( 'manage_woocommerce' ) ) {
@@ -545,16 +577,21 @@ final class WC_Hierarchical_Sorting {
         $action = isset( $_POST['wc_hs_action'] ) ? sanitize_text_field( wp_unslash( $_POST['wc_hs_action'] ) ) : '';
 
         if ( 'start' === $action ) {
-            self::start_migration();
+            self::schedule_migration();
             wp_send_json_success( array( 'message' => __( 'Migration started.', 'wc-hierarchical-sorting' ) ) );
-        } elseif ( 'status' === $action ) {
-            $status = self::get_migration_status();
-            wp_send_json_success( $status );
-        } else {
-            wp_send_json_error( array( 'message' => __( 'Invalid action.', 'wc-hierarchical-sorting' ) ) );
         }
+
+        if ( 'status' === $action ) {
+            wp_send_json_success( self::get_migration_status() );
+        }
+
+        wp_send_json_error( array( 'message' => __( 'Invalid action.', 'wc-hierarchical-sorting' ) ) );
     }
 }
+
+// Activation / deactivation hooks
+register_activation_hook( __FILE__, array( 'WC_Hierarchical_Sorting', 'on_activation' ) );
+register_deactivation_hook( __FILE__, array( 'WC_Hierarchical_Sorting', 'on_deactivation' ) );
 
 add_action( 'plugins_loaded', array( 'WC_Hierarchical_Sorting', 'init' ) );
 
@@ -564,9 +601,9 @@ if ( ! function_exists( 'wc_hs_build_product_sort_key' ) ) {
     }
 }
 
-if ( ! function_exists( 'wc_hs_start_migration' ) ) {
-    function wc_hs_start_migration() {
-        return WC_Hierarchical_Sorting::start_migration();
+if ( ! function_exists( 'wc_hs_schedule_migration' ) ) {
+    function wc_hs_schedule_migration() {
+        return WC_Hierarchical_Sorting::schedule_migration();
     }
 }
 
